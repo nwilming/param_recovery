@@ -12,41 +12,47 @@ from itertools import zip_longest, product
 from multiprocessing import Pool
 
 
-# SIMULATE DATA
-rH = 1 / 70
-rgen_var = 1
-rV = 1
-trials = 8400
-
-
-models = {'vfix': 'stan_models/inv_glaze_b_fixV.stan',
+models = {'none': 'stan_models/inv_glaze_b.stan',
+          'vfix': 'stan_models/inv_glaze_b_fixV.stan',
           'gvfix': 'stan_models/inv_glaze_b_fixgen_var.stan'}
+
+nr_reps = 200
 
 
 def fix_keys():
-    Hs = [.01, .05, .1, .15, .2, .25, .3, .35, .4, .45]
-    Hs += [1 - x for x in Hs]
-    Vs = [1, 1.5, 2, 2.5, 3, 3.5, 4, 4.5, 5]
-    gvs = [1, 1.5, 2, 2.5, 3, 3.5]
-    for V, H, i in product(Vs, Hs, range(200)):
-        yield(H, V, 1, i, 'V', models['gvfix'], 'gvfix', ['H', 'V'], 35., 5000)
-    for gv, H, i in product(gvs, Hs, range(200)):
-        yield(H, 1, gv, i, 'V', models['vfix'], 'vfix', ['H', 'V'], 35., 5000)
+    Hs = [1 / 5., 1 / 10., 1 / 20., 1 / 30., 1 / 40, 1 / 50.]
+    Vs = [1, 1.5, 2, 2.5, 3, 3.5, 4]
+    gvs = [1, 1.5, 2, 2.5, 3]
+    isis = [1, 2, 5, 10, 20]
+    for i in range(nr_reps):
+        for V, H, isi in product(Vs, Hs, isis):
+            yield(H, V, 1, i,  'V', models['gvfix'], 'gvfix',
+                  ['H', 'V'], isi, 1000)
+        for gv, H, isi in product(gvs, Hs, isis):
+            yield(H, 1, gv, i, 'V', models['vfix'], 'vfix',
+                  ['H', 'V'], isi, 1000)
+        for V, gv, H, isi in product(Vs, gvs, Hs, isis):
+            yield(H, V, gv, i, 'V', models['none'], 'none',
+                  ['H', 'V'], isi, 1000)
 
 
-def par_execute(ii, chunk):
-    #print(ii, len(chunk))
-    chunk = [arg for arg in chunk if arg is not None]
+def par_execute(ii, chunks):
+    chunks = [arg for arg in chunks if arg is not None]
+    chunks = grouper(chunks, 16)
+    results = []
     with Pool(16) as p:
-        values = p.starmap(execute, chunk)
-        print(values)
-        df = pd.DataFrame(values)
-        df.to_hdf('/work/faty014/simulation_fit_05-10-2018-3', key=str(ii))
+        for chunk in chunks:
+            values = p.starmap(execute, chunk)
+            results.extend(values)
+            df = pd.DataFrame(values)
+            df.to_hdf(
+                '/work/faty014/kobe_param_rec', key=str(ii))
 
 
 def execute(H, V, gv, i, var, model, fixed_variable, parameters, isi, trials):
     model_file = decim.get_data(model)
-    compilefile = join('/work/faty014', model.replace('/', '') + 'stan_compiled.pkl')
+    compilefile = join(
+        '/work/faty014', model.replace('/', '') + 'stan_compiled.pkl')
     try:
         sm = pickle.load(open(compilefile, 'rb'))
     except IOError:
@@ -57,14 +63,30 @@ def execute(H, V, gv, i, var, model, fixed_variable, parameters, isi, trials):
     data = pt.complete(points, V=V, gen_var=gv, H=H, method='inverse')
     data = gs.data_from_df(data)
 
-    fit = sm.sampling(data=data, iter=5000, chains=2, n_jobs=1)
-    d = {parameter: fit.extract(parameter)[parameter] for parameter in parameters}
+    fit = sm.sampling(data=data, iter=2500, chains=2, n_jobs=1)
+    d = {parameter: fit.extract(parameter)[parameter]
+         for parameter in parameters}
     if fixed_variable == 'gvfix':
-        dr = {'vmode': statmisc.mode(d['V'], 50), 'vupper': statmisc.hdi(d['V'])[1], 'vlower': statmisc.hdi(d['V'])[0],
-              'gvmode': np.nan, 'gvupper': np.nan, 'gvlower': np.nan}
+        dr = {'vmode': statmisc.mode(d['V'], 50),
+              'vupper': statmisc.hdi(d['V'])[1],
+              'vlower': statmisc.hdi(d['V'])[0],
+              'gvmode': np.nan,
+              'gvupper': np.nan,
+              'gvlower': np.nan}
+    elif fixed_variable == 'vfix':
+        dr = {'vmode': np.nan,
+              'vupper': np.nan,
+              'vlower': np.nan,
+              'gvmode': statmisc.mode(d['gen_var'], 50),
+              'gvupper': statmisc.hdi(d['gen_var'])[1],
+              'gvlower': statmisc.hdi(d['gen_var'])[0]}
     else:
-        dr = {'vmode': np.nan, 'vupper': np.nan, 'vlower': np.nan,
-              'gvmode': statmisc.mode(d['gen_var'], 50), 'gvupper': statmisc.hdi(d['gen_var'])[1], 'gvlower': statmisc.hdi(d['gen_var'])[0]}
+        dr = {'vmode': statmisc.mode(d['V'], 50),
+              'vupper': statmisc.hdi(d['V'])[1],
+              'vlower': statmisc.hdi(d['V'])[0],
+              'gvmode': statmisc.mode(d['gen_var'], 50),
+              'gvupper': statmisc.hdi(d['gen_var'])[1],
+              'gvlower': statmisc.hdi(d['gen_var'])[0]}
     dr['true_V'] = V
     dr['true_H'] = H
     dr['true_gen_var'] = gv
@@ -85,7 +107,7 @@ def grouper(iterable, n, fillvalue=None):
 
 def submit():
     from decim import slurm_submit as slu
-    for ii, chunk in enumerate(grouper(fix_keys(), 2000)):
+    for ii, chunk in enumerate(grouper(fix_keys(), 1000)):
         slu.pmap(par_execute, ii, chunk, walltime='11:55:00',
                  memory=60, nodes=1, tasks=16, name='PRECOVERY')
 
